@@ -1,0 +1,284 @@
+
+import { DynamoDB } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocument } from '@aws-sdk/lib-dynamodb';
+import { SNS } from '@aws-sdk/client-sns';
+import { IoTDataPlane } from '@aws-sdk/client-iot-data-plane';
+
+const dynamo = DynamoDBDocument.from(new DynamoDB());
+const sns = new SNS();
+const iotData = new IoTDataPlane();
+
+export const handler = async (event) => {
+    let body;
+    let statusCode = '200';
+    const headers = {
+        'Content-Type': 'application/json',
+    };
+
+    try {
+        switch (event.httpMethod) {
+            case 'DELETE':
+                /*
+                   {
+                        "httpMethod": "DELETE",
+                        "body": "{\"TableName\": \"Projeto_DB\", \"Key\": {\"id\": \"2\", \"ts\": \"1557980655000\"}}"
+                    }
+                */
+                body = await dynamo.delete(JSON.parse(event.body));
+                break;
+            case 'GET':
+                if (event.queryStringParameters) {
+                    const id = event.queryStringParameters.id;
+                    const baseFilterExpression = 'APP = :appValue';
+                    const baseExpressionAttributeValues = { ':appValue': "0" };
+                    
+                    if (event.queryStringParameters.action === 'latest') {
+                        /*
+                            {
+                                "httpMethod": "GET",
+                                "queryStringParameters": {
+                                    "TableName": "Projeto_DB",
+                                    "action": "latest",
+                                    "id": "1", // optional
+                                }
+                            }
+                        */
+                        if (!id) {
+                            throw new Error('Missing "id" in queryStringParameters');
+                        }
+                        console.log('ID fornecido:', id);
+            
+                        const params = {
+                            TableName: event.queryStringParameters.TableName,
+                            KeyConditionExpression: 'ID = :idValue',
+                            ExpressionAttributeValues: {
+                                ...baseExpressionAttributeValues,
+                                ':idValue': id
+                            },
+                            FilterExpression: baseFilterExpression,
+                            ExpressionAttributeNames: {
+                                '#ts': 'Timestamp'
+                            },
+                            ProjectionExpression: 'Temperature, Humidity, Light, #ts',
+                            ScanIndexForward: false,
+                            Limit: 1 // Inicialmente tenta com Limit: 1
+                        };
+            
+                        let result;
+                        let retryCount = 0;
+            
+                        do {
+                            console.log(`Tentativa ${retryCount + 1} com Limit: ${params.Limit}`);
+                            result = await dynamo.query(params);
+            
+                            if (result.Items.length === 0) {
+                                console.log(`Item with ID "${id}" not found.`);
+                                params.Limit++; // Incrementa o limite para tentar novamente
+                            }
+                            retryCount++;
+                        } while (result.Items.length === 0);
+            
+                        if (result.Items.length === 0) {
+                            throw new Error(`Item with ID "${id}" not found.`);
+                        } else {
+                            body = result.Items;
+                        }
+                    } else if (event.queryStringParameters.attribute) {
+                        /*
+                            {
+                                "httpMethod": "GET",
+                                "queryStringParameters": {
+                                    "TableName": "Projeto_DB",
+                                    "attribute": "Temperature", // ou "Humidity" ou "Light"
+                                    "id": "1"
+                                }
+                            }
+                        */
+                        const attribute = event.queryStringParameters.attribute;
+                        const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
+                        const params = {
+                            TableName: event.queryStringParameters.TableName,
+                            ProjectionExpression: `${attribute}, #ts`,
+                            FilterExpression: id ? `${baseFilterExpression} AND ID = :idValue AND #ts > :timeLimit` : `${baseFilterExpression} AND #ts > :timeLimit`,
+                            ExpressionAttributeNames: {
+                                '#ts': 'Timestamp'
+                            },
+                            ExpressionAttributeValues: id ?
+                                { 
+                                    ...baseExpressionAttributeValues, 
+                                    ':idValue': id, 
+                                    ':timeLimit': twentyFourHoursAgo 
+                                } :
+                                { 
+                                    ...baseExpressionAttributeValues, 
+                                    ':timeLimit': twentyFourHoursAgo 
+                                }
+                        };
+                        body = await dynamo.scan(params);
+                        body.Items.forEach(item => delete item.APP);
+                    } else if (event.queryStringParameters.average === '1') {
+                        /*
+                            {
+                                "httpMethod": "GET",
+                                "queryStringParameters": {
+                                    "TableName": "Projeto_DB",
+                                    "average": "1",
+                                    "id": "1"
+                                }
+                            }
+                        */
+                        const params = {
+                            TableName: event.queryStringParameters.TableName,
+                            ProjectionExpression: 'Temperature, Humidity, Light',
+                            FilterExpression: id ? `${baseFilterExpression} AND ID = :idValue` : baseFilterExpression,
+                            ExpressionAttributeValues: id ? { ...baseExpressionAttributeValues, ':idValue': id } : baseExpressionAttributeValues
+                        };
+                        const result = await dynamo.scan(params);
+            
+                        let sumTemperature = 0;
+                        let sumHumidity = 0;
+                        let sumLight = 0;
+                        result.Items.forEach(item => {
+                            sumTemperature += parseFloat(item.Temperature);
+                            sumHumidity += parseFloat(item.Humidity);
+                            sumLight += parseFloat(item.Light);
+                        });
+            
+                        const averageTemperature = (sumTemperature / result.Items.length).toFixed(2);
+                        const averageHumidity = (sumHumidity / result.Items.length).toFixed(2);
+                        const averageLight = (sumLight / result.Items.length).toFixed(2);
+            
+                        body = {
+                            averageTemperature,
+                            averageHumidity,
+                            averageLight
+                        };
+                    } else if (event.queryStringParameters.getAllIds === '1') {
+                        /*
+                            {
+                                "httpMethod": "GET",
+                                "queryStringParameters": {
+                                    "TableName": "Projeto_DB",
+                                    "getAllIds": "1"
+                                }
+                            }
+                        */
+                        const params = {
+                            TableName: event.queryStringParameters.TableName,
+                            ProjectionExpression: 'ID',
+                            FilterExpression: baseFilterExpression,
+                            ExpressionAttributeValues: baseExpressionAttributeValues
+                        };
+                        const result = await dynamo.scan(params);
+                        const uniqueIds = [...new Set(result.Items.map(item => item.ID))];
+                        body = uniqueIds;
+                    } else {
+                        /*
+                            {
+                                "httpMethod": "GET",
+                                "queryStringParameters": {
+                                    "TableName": "Projeto_DB",
+                                    "id": "1"
+                                }
+                            }
+                        */
+                        const params = {
+                            TableName: event.queryStringParameters.TableName,
+                            FilterExpression: id ? `${baseFilterExpression} AND ID = :idValue` : baseFilterExpression,
+                            ExpressionAttributeValues: id ? { ...baseExpressionAttributeValues, ':idValue': id } : baseExpressionAttributeValues
+                        };
+                        body = await dynamo.scan(params);
+                    }
+                }
+                break;
+            case 'POST':
+                const item = JSON.parse(event.body);
+
+                if (item.action === 'sendDeviceStates') {
+                    /*
+                        {
+                            "httpMethod": "POST",
+                            "body": "{\"action\": \"sendDeviceStates\", \"ID\": \"1\", \"Ventilador\": \"1\", \"Aquecedor\": \"1\", \"Desumidificador\": \"1\", \"Humidificador\": \"1\", \"Tapar_Luz\": \"1\", \"Dar_Luz\": \"1\"}"
+                        }
+                    */
+                    const deviceStates = {
+                        "ID": item.ID,
+                        "Ventilador": item.Ventilador || "0",
+                        "Aquecedor": item.Aquecedor || "0",
+                        "Desumidificador": item.Desumidificador || "0",
+                        "Humidificador": item.Humidificador || "0",
+                        "Tapar_Luz": item.Tapar_Luz || "0",
+                        "Dar_Luz": item.Dar_Luz || "0"
+                    };
+
+                    const snsMessage = {
+                        Message: JSON.stringify(deviceStates),
+                        TopicArn: 'arn:aws:sns:eu-west-1:905418195576:projeto_app'
+                    };
+                    await sns.publish(snsMessage);
+
+                    const mqttMessage = JSON.stringify(deviceStates);
+                    const mqttParams = {
+                        topic: 'projeto/app',
+                        payload: mqttMessage,
+                        qos: 0
+                    };
+                    await iotData.publish(mqttParams);
+
+                    body = { message: 'Device states sent successfully' };
+                } else if (item.TableName && item.Item) {
+                    /*
+                        {
+                            "httpMethod": "POST",
+                            "body": "{\"TableName\": \"Projeto_DB\", \"Item\": {\"ID\": \"200\", \"Timestamp\": 1557980655000, \"APP\": \"1\", \"Temperature\": \"12.07\",\"Humidity\": \"55.02\", \"Light\": \"16880\"}}"
+                        }
+                    */
+                    body = await dynamo.put(item);
+
+                    if (item.Item.APP === "1") {
+                        const snsMessage = {
+                            Message: JSON.stringify(item.Item),
+                            TopicArn: 'arn:aws:sns:eu-west-1:905418195576:projeto_app'
+                        };
+                        await sns.publish(snsMessage);
+
+                        const mqttMessage = JSON.stringify(item.Item);
+                        const mqttParams = {
+                            topic: 'projeto/app',
+                            payload: mqttMessage,
+                            qos: 0
+                        };
+                        await iotData.publish(mqttParams);
+                    }
+                } else {
+                    throw new Error('Invalid POST request');
+                }
+                break;
+            case 'PUT':
+                /*
+                    {
+                        "httpMethod": "PUT",
+                        "body": "{\"TableName\": \"ProjetoDB\", \"Key\": {\"id\": \"2\", \"ts\": \"1557980655000\"},
+                        \"UpdateExpression\": \"set #temp = :tempValue, #humidade = :humidadeValue, #luz = :luzValue\",
+                        \"ExpressionAttributeNames\": {\"#temp\": \"temp\", \"#humidade\": \"humidade\", \"#luz\": \"luz\"},
+                        \"ExpressionAttributeValues\": {\":tempValue\": \"25\", \":humidadeValue\": \"60\", \":luzValue\": \"80\"}}"
+                    }
+                */
+                body = await dynamo.update(JSON.parse(event.body));
+                break;
+            default:
+                throw new Error(`Unsupported method "${event.httpMethod}"`);
+        }
+    } catch (err) {
+        statusCode = '400';
+        body = err.message;
+    } finally {
+        body = JSON.stringify(body);
+    }
+
+    return {
+        statusCode,
+        body,
+        headers,
+    };
+};
